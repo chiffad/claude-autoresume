@@ -1,0 +1,1 @@
+{"type":"assistant","error":"rate_limit","isApiErrorMessage":true,"sessionId":"2649ba30-abcd-4321-beef-123456789abc","cwd":"/Users/dprokofiev/prj/exploring/claude-autoresume","timestamp":"2026-04-07T16:08:42.193Z","message":{"content":[{"text":"You've hit your limit · resets 7pm (Europe/Paris)"}]}}
