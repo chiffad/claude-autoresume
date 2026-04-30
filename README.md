@@ -29,30 +29,7 @@ claude --dangerously-load-development-channels server:autoresume
 
 > **Troubleshooting:** If you get `server:autoresume · no MCP server configured with that name`, re-run `./setup.sh` and verify the `autoresume` entry exists in `~/.claude.json`.
 
-## Testing channel injection
-
-`test_channel_inject.py` lets you manually inject a prompt into a running Claude Code session via the autoresume channel.
-
-### Prerequisites
-
-- Claude Code running with the autoresume channel loaded:
-  ```bash
-  claude --dangerously-load-development-channels server:autoresume
-  ```
-- The channel server must be listening (default port 18963)
-
-### Usage
-
-```bash
-# Check if the channel is reachable
-python3 test_channel_inject.py --check
-
-# Inject the default resume prompt
-python3 test_channel_inject.py
-
-# Inject a custom prompt
-python3 test_channel_inject.py "say hello world"
-```
+## Testing
 
 ### Unit tests
 

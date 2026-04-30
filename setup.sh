@@ -19,8 +19,22 @@ if ! command -v python3 &>/dev/null; then
 fi
 PYTHON3="$(command -v python3)"
 
+# Require Python 3.9+ (zoneinfo module)
+if ! "$PYTHON3" -c 'import sys; exit(0 if sys.version_info >= (3, 9) else 1)'; then
+  PY_VERSION="$("$PYTHON3" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  echo "Error: Python 3.9+ required, found $PY_VERSION" >&2
+  exit 1
+fi
+
 if ! command -v node &>/dev/null; then
   echo "Error: node not found in PATH" >&2
+  exit 1
+fi
+
+# Require Node.js 18+
+NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])')"
+if [ "$NODE_MAJOR" -lt 18 ]; then
+  echo "Error: Node.js 18+ required, found $(node --version)" >&2
   exit 1
 fi
 
@@ -39,14 +53,26 @@ fi
 echo "Installing channel server dependencies..."
 (cd "$CHANNEL_DIR" && npm install --silent)
 
-# --- 2. Register MCP server in ~/.claude.json ---
+# --- 2. Generate auth token ---
+
+AUTH_TOKEN_FILE="$LOG_DIR/auth-token"
+mkdir -p "$LOG_DIR"
+if [ ! -f "$AUTH_TOKEN_FILE" ]; then
+  python3 -c "import secrets; print(secrets.token_hex(32))" > "$AUTH_TOKEN_FILE"
+  chmod 600 "$AUTH_TOKEN_FILE"
+  echo "Generated auth token: $AUTH_TOKEN_FILE"
+else
+  echo "Auth token already exists: $AUTH_TOKEN_FILE"
+fi
+
+# --- 3. Register MCP server in ~/.claude.json ---
 
 echo "Configuring MCP server..."
-python3 -c "
-import json, sys
+CLAUDE_CONFIG="$CLAUDE_CONFIG" CHANNEL_SCRIPT="$CHANNEL_SCRIPT" python3 -c "
+import json, os, sys, tempfile
 
-path = '$CLAUDE_CONFIG'
-server_script = '$CHANNEL_SCRIPT'
+path = os.environ['CLAUDE_CONFIG']
+server_script = os.environ['CHANNEL_SCRIPT']
 
 with open(path) as f:
     config = json.load(f)
@@ -60,13 +86,21 @@ else:
         'command': 'node',
         'args': [server_script],
     }
-    with open(path, 'w') as f:
-        json.dump(config, f, indent=2)
-        f.write('\n')
+    # Write to a temp file and atomically rename to avoid corruption
+    dir_name = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(config, f, indent=2)
+            f.write('\n')
+        os.replace(tmp_path, path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
     print('  Added autoresume MCP server to ' + path)
 "
 
-# --- 3. Install and start the daemon ---
+# --- 4. Install and start the daemon ---
 
 echo "Installing daemon..."
 mkdir -p "$(dirname "$DAEMON_DEST")"

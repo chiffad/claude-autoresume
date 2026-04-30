@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
+import sys
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -65,7 +67,8 @@ def parse_reset_time(reset_text: str, now: Optional[datetime] = None) -> datetim
     reset = now.astimezone(tz).replace(hour=hour, minute=minutes, second=0, microsecond=0)
 
     if reset <= now.astimezone(tz):
-        reset += timedelta(days=1)
+        tomorrow = reset.date() + timedelta(days=1)
+        reset = reset.replace(year=tomorrow.year, month=tomorrow.month, day=tomorrow.day)
 
     return reset
 
@@ -98,6 +101,10 @@ class FileWatcher:
         """Read new lines from the file and invoke callback for each."""
         try:
             with open(self._path, "r") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                if size < self._offset:
+                    self._offset = 0
                 f.seek(self._offset)
                 data = f.read()
                 self._offset = f.tell()
@@ -111,19 +118,40 @@ class FileWatcher:
 
 RESUME_PROMPT = "continue the task from where it was interrupted by the usage limit"
 CHANNEL_PORT = int(os.environ.get("AUTORESUME_PORT", "18963"))
+AUTH_TOKEN_PATH = Path(
+    os.environ.get(
+        "AUTORESUME_TOKEN_FILE",
+        Path.home() / ".local" / "share" / "claude-autoresume" / "auth-token",
+    )
+)
+
+
+def _load_auth_token() -> Optional[str]:
+    try:
+        return AUTH_TOKEN_PATH.read_text().strip()
+    except FileNotFoundError:
+        return None
 
 
 def try_post_channel(prompt: str) -> bool:
-    """POST the resume prompt to the autoresume channel server."""
+    """POST the resume prompt to the autoresume channel server.
+
+    Returns True on a 200 response, False on any error.
+    Note: urllib raises HTTPError for non-2xx, so failures go through except.
+    """
     try:
         req = urllib.request.Request(
             f"http://127.0.0.1:{CHANNEL_PORT}",
             data=prompt.encode(),
             method="POST",
         )
+        token = _load_auth_token()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status == 200
-    except Exception:
+    except Exception as exc:
+        log.debug("Channel POST failed: %s", exc)
         return False
 
 
@@ -132,7 +160,9 @@ def send_notification(title: str, body: str) -> None:
     safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
     safe_body = body.replace("\\", "\\\\").replace('"', '\\"')
     script = f'display notification "{safe_body}" with title "{safe_title}"'
-    subprocess.run(["osascript", "-e", script], check=False)
+    result = subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
+    if result.returncode != 0:
+        log.debug("osascript failed (rc=%d): %s", result.returncode, result.stderr.decode().strip())
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +171,7 @@ def send_notification(title: str, body: str) -> None:
 
 POLL_INTERVAL_SECONDS = 10
 RESUME_GRACE_SECONDS = 90
+MAX_RESUME_ATTEMPTS = 5
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +182,7 @@ class PendingResume:
     cwd: str
     reset_at: datetime
     notified: bool = False
+    resume_attempts: int = 0
 
 
 def make_rate_limit_handler(pending: List[PendingResume]) -> Callable[[str], None]:
@@ -159,7 +191,11 @@ def make_rate_limit_handler(pending: List[PendingResume]) -> Callable[[str], Non
     def _handler(line: str) -> None:
         if not is_rate_limit_entry(line):
             return
-        info = extract_rate_limit_info(line)
+        try:
+            info = extract_rate_limit_info(line)
+        except (KeyError, IndexError, TypeError) as exc:
+            log.warning("Malformed rate-limit entry — skipping: %s", exc)
+            return
         # Deduplicate by session_id
         if any(p.session_id == info["session_id"] for p in pending):
             return
@@ -184,6 +220,57 @@ def make_rate_limit_handler(pending: List[PendingResume]) -> Callable[[str], Non
     return _handler
 
 
+def process_pending_resumes(pending: List[PendingResume]) -> None:
+    """Process pending resumes: notify, attempt channel POST, handle retries.
+
+    Extracted from run_daemon's inner loop to enable testing.
+    """
+    for pr in list(pending):
+        project = os.path.basename(pr.cwd) or pr.session_id[:8]
+
+        if not pr.notified:
+            send_notification(
+                "Claude Rate Limit",
+                f"{project} — resets at {pr.reset_at.strftime('%H:%M %Z')}",
+            )
+            pr.notified = True
+            log.info(
+                "Waiting for reset: session=%s at %s",
+                pr.session_id,
+                pr.reset_at.isoformat(),
+            )
+
+        now = datetime.now(pr.reset_at.tzinfo)
+        if now >= pr.reset_at + timedelta(seconds=RESUME_GRACE_SECONDS):
+            if try_post_channel(RESUME_PROMPT):
+                log.info("Resumed via channel session=%s", pr.session_id)
+                send_notification(
+                    "Claude Resuming",
+                    f"{project} — resuming now",
+                )
+                pending.remove(pr)
+            else:
+                pr.resume_attempts += 1
+                if pr.resume_attempts >= MAX_RESUME_ATTEMPTS:
+                    log.warning(
+                        "Channel POST failed %d times for session=%s — giving up",
+                        pr.resume_attempts,
+                        pr.session_id,
+                    )
+                    send_notification(
+                        "Claude Resume Failed",
+                        f"{project} — channel not reachable after {pr.resume_attempts} attempts",
+                    )
+                    pending.remove(pr)
+                else:
+                    log.info(
+                        "Channel POST failed for session=%s — attempt %d/%d, will retry",
+                        pr.session_id,
+                        pr.resume_attempts,
+                        MAX_RESUME_ATTEMPTS,
+                    )
+
+
 def run_daemon(projects_root: Optional[Path] = None) -> None:
     """Main loop: watch JSONL files, notify on rate limits, auto-resume."""
     if projects_root is None:
@@ -193,11 +280,21 @@ def run_daemon(projects_root: Optional[Path] = None) -> None:
     watchers: dict[str, FileWatcher] = {}
     handler = make_rate_limit_handler(pending)
 
+    running = True
+
+    def _shutdown(signum, _frame):
+        nonlocal running
+        log.info("Received signal %s — shutting down", signal.Signals(signum).name)
+        running = False
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
     log.info("Daemon started — watching %s", projects_root)
 
-    while True:
+    while running:
         # 1. Discover JSONL files
-        for path in glob.glob(str(projects_root / "*" / "*.jsonl")):
+        for path in glob.glob(str(projects_root / "**" / "*.jsonl"), recursive=True):
             if path not in watchers:
                 log.info("Watching new file: %s", path)
                 watchers[path] = FileWatcher(path, handler, skip_existing=True)
@@ -209,38 +306,8 @@ def run_daemon(projects_root: Optional[Path] = None) -> None:
                 continue
             watchers[path].scan()
 
-        # 3. Process pending resumes (iterate over a copy to allow removal)
-        for pr in list(pending):
-            if not pr.notified:
-                send_notification(
-                    "Claude Rate Limit",
-                    f"Session {pr.session_id[:8]}… resets at {pr.reset_at.strftime('%H:%M %Z')}",
-                )
-                pr.notified = True
-                log.info(
-                    "Waiting for reset: session=%s at %s",
-                    pr.session_id,
-                    pr.reset_at.isoformat(),
-                )
-
-            now = datetime.now(pr.reset_at.tzinfo)
-            if now >= pr.reset_at + timedelta(seconds=RESUME_GRACE_SECONDS):
-                if try_post_channel(RESUME_PROMPT):
-                    log.info("Resumed via channel session=%s", pr.session_id)
-                    send_notification(
-                        "Claude Resuming",
-                        f"Session {pr.session_id[:8]}… resuming now",
-                    )
-                else:
-                    log.warning(
-                        "Channel POST failed for session=%s — is Claude running with --channels?",
-                        pr.session_id,
-                    )
-                    send_notification(
-                        "Claude Resume Failed",
-                        f"Session {pr.session_id[:8]}… channel not reachable",
-                    )
-                pending.remove(pr)
+        # 3. Process pending resumes
+        process_pending_resumes(pending)
 
         # 4. Sleep
         time.sleep(POLL_INTERVAL_SECONDS)
