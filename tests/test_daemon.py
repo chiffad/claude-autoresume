@@ -9,7 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from unittest.mock import patch
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Allow `import daemon` from tests
@@ -30,6 +30,7 @@ from daemon import (
     PendingResume,
     RESUME_GRACE_SECONDS,
     MAX_RESUME_ATTEMPTS,
+    UNKNOWN_RESET_FALLBACK_MINUTES,
 )
 
 
@@ -334,8 +335,8 @@ def test_handler_ignores_normal_entries():
     assert len(pending) == 0
 
 
-def test_handler_skips_unparseable_reset_time():
-    """Rate-limit entry with garbled reset text is skipped with a warning."""
+def test_handler_uses_fallback_for_unparseable_reset_time():
+    """Rate-limit entry with garbled reset text uses fallback reset time."""
     raw = _json.loads((FIXTURES / "rate_limit_entry.jsonl").read_text().strip())
     raw["message"]["content"][0]["text"] = "You've hit your limit · resets ???"
     line = _json.dumps(raw)
@@ -343,7 +344,40 @@ def test_handler_skips_unparseable_reset_time():
     pending: list[PendingResume] = []
     handler = make_rate_limit_handler(pending)
     handler(line)
-    assert len(pending) == 0
+    assert len(pending) == 1
+    expected_min = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=UNKNOWN_RESET_FALLBACK_MINUTES - 1)
+    expected_max = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=UNKNOWN_RESET_FALLBACK_MINUTES + 1)
+    assert expected_min <= pending[0].reset_at <= expected_max
+
+
+# --- Group limit (no reset time in message) ---
+
+
+def test_handler_creates_pending_for_group_limit():
+    """Group limit entry with no 'resets ...' text creates PendingResume with fallback."""
+    line = (FIXTURES / "group_limit_entry.jsonl").read_text().strip()
+    pending: list[PendingResume] = []
+    handler = make_rate_limit_handler(pending)
+    handler(line)
+    assert len(pending) == 1
+    assert pending[0].session_id == "1a15fe16-fa23-466f-a416-74ed3a13d8ac"
+    expected_min = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=UNKNOWN_RESET_FALLBACK_MINUTES - 1)
+    expected_max = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=UNKNOWN_RESET_FALLBACK_MINUTES + 1)
+    assert expected_min <= pending[0].reset_at <= expected_max
+
+
+def test_is_rate_limit_entry_group_limit():
+    """Group limit JSONL line is detected as rate limit."""
+    line = (FIXTURES / "group_limit_entry.jsonl").read_text().strip()
+    assert is_rate_limit_entry(line) is True
+
+
+def test_extract_rate_limit_info_group_limit_no_reset_text():
+    """Group limit entry returns reset_text=None."""
+    line = (FIXTURES / "group_limit_entry.jsonl").read_text().strip()
+    info = extract_rate_limit_info(line)
+    assert info["session_id"] == "1a15fe16-fa23-466f-a416-74ed3a13d8ac"
+    assert info["reset_text"] is None
 
 
 # --- CRITICAL: parse_reset_time 12am/12pm boundary tests ---

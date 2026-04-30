@@ -172,6 +172,7 @@ def send_notification(title: str, body: str) -> None:
 POLL_INTERVAL_SECONDS = 10
 RESUME_GRACE_SECONDS = 90
 MAX_RESUME_ATTEMPTS = 5
+UNKNOWN_RESET_FALLBACK_MINUTES = 5
 
 log = logging.getLogger(__name__)
 
@@ -199,11 +200,15 @@ def make_rate_limit_handler(pending: List[PendingResume]) -> Callable[[str], Non
         # Deduplicate by session_id
         if any(p.session_id == info["session_id"] for p in pending):
             return
-        try:
-            reset_at = parse_reset_time(info["reset_text"])
-        except (ValueError, TypeError):
-            log.warning("Could not parse reset time %r — skipping", info["reset_text"])
-            return
+        if info["reset_text"]:
+            try:
+                reset_at = parse_reset_time(info["reset_text"])
+            except ValueError:
+                log.warning("Could not parse reset time %r — using fallback", info["reset_text"])
+                reset_at = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=UNKNOWN_RESET_FALLBACK_MINUTES)
+        else:
+            log.info("No reset time in message — will retry in %d min", UNKNOWN_RESET_FALLBACK_MINUTES)
+            reset_at = datetime.now(ZoneInfo("UTC")) + timedelta(minutes=UNKNOWN_RESET_FALLBACK_MINUTES)
         pending.append(
             PendingResume(
                 session_id=info["session_id"],
