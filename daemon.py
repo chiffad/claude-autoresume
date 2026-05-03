@@ -173,6 +173,9 @@ POLL_INTERVAL_SECONDS = 10
 RESUME_GRACE_SECONDS = 90
 MAX_RESUME_ATTEMPTS = 5
 UNKNOWN_RESET_FALLBACK_MINUTES = 5
+STALE_SCAN_INTERVAL_SECONDS = 600
+STALE_SCAN_MAX_AGE_SECONDS = 72 * 3600
+VERIFY_WINDOW_SECONDS = 120
 
 log = logging.getLogger(__name__)
 
@@ -182,8 +185,10 @@ class PendingResume:
     session_id: str
     cwd: str
     reset_at: datetime
+    jsonl_path: Optional[str] = None
     notified: bool = False
     resume_attempts: int = 0
+    resume_sent_at: Optional[datetime] = None
 
 
 def make_rate_limit_handler(pending: List[PendingResume]) -> Callable[[str], None]:
@@ -225,10 +230,133 @@ def make_rate_limit_handler(pending: List[PendingResume]) -> Callable[[str], Non
     return _handler
 
 
-def process_pending_resumes(pending: List[PendingResume]) -> None:
-    """Process pending resumes: notify, attempt channel POST, handle retries.
+def find_unresolved_rate_limits(jsonl_paths: List[str]) -> List[dict]:
+    """Scan JSONL files for sessions stuck at a rate limit.
 
-    Extracted from run_daemon's inner loop to enable testing.
+    A session is "stuck" if its last ``rate_limit`` entry has no subsequent
+    ``assistant`` activity (queue-operation / user entries from a daemon
+    resume attempt don't count).
+    """
+    results: List[dict] = []
+    for path in jsonl_paths:
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except (FileNotFoundError, PermissionError):
+            continue
+
+        last_rl_line: Optional[str] = None
+        has_assistant_after = False
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if is_rate_limit_entry(stripped):
+                last_rl_line = stripped
+                has_assistant_after = False
+            elif last_rl_line:
+                try:
+                    entry = json.loads(stripped)
+                    if entry.get("type") == "assistant" and not entry.get("error"):
+                        has_assistant_after = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        if last_rl_line and not has_assistant_after:
+            try:
+                info = extract_rate_limit_info(last_rl_line)
+                info["jsonl_path"] = path
+                results.append(info)
+            except (KeyError, IndexError, TypeError):
+                pass
+
+    return results
+
+
+def find_claude_session_cwds() -> set:
+    """Return cwds of all running Claude CLI processes (two subprocess calls)."""
+    try:
+        ps = subprocess.run(
+            ["ps", "aux"], capture_output=True, text=True, timeout=10
+        )
+        pids = []
+        for line in ps.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 11:
+                continue
+            cmd = " ".join(parts[10:])
+            if "claude" in cmd and "autoresume" not in cmd:
+                pids.append(parts[1])
+        if not pids:
+            return set()
+
+        lsof = subprocess.run(
+            ["lsof", "-a", "-p", ",".join(pids), "-d", "cwd", "-Fn"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return {
+            line[1:]
+            for line in lsof.stdout.splitlines()
+            if line.startswith("n") and len(line) > 1 and line[1] == "/"
+        }
+    except Exception as exc:
+        log.debug("Failed to enumerate Claude processes: %s", exc)
+        return set()
+
+
+def is_latest_session_in_project(jsonl_path: str) -> bool:
+    """True if *jsonl_path* is the most recently modified JSONL in its project dir.
+
+    Older sessions in the same directory are almost certainly dead — a newer
+    session has taken over.  Subagent files are excluded from comparison.
+    """
+    project_dir = os.path.dirname(jsonl_path)
+    try:
+        siblings = [
+            p
+            for p in glob.glob(os.path.join(project_dir, "*.jsonl"))
+            if "/subagents/" not in p
+        ]
+        if not siblings:
+            return False
+        most_recent = max(siblings, key=os.path.getmtime)
+        return os.path.abspath(jsonl_path) == os.path.abspath(most_recent)
+    except (OSError, ValueError):
+        return False
+
+
+def has_new_assistant_activity(jsonl_path: str, after: datetime) -> bool:
+    """True if *jsonl_path* contains an assistant entry (without error) after *after*."""
+    after_iso = after.strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        with open(jsonl_path) as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    entry = json.loads(stripped)
+                    if (
+                        entry.get("type") == "assistant"
+                        and not entry.get("error")
+                        and entry.get("timestamp", "") > after_iso
+                    ):
+                        return True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    except (FileNotFoundError, PermissionError):
+        pass
+    return False
+
+
+def process_pending_resumes(pending: List[PendingResume]) -> None:
+    """Process pending resumes: notify, attempt channel POST, verify activity.
+
+    Three states per entry:
+      1. Waiting — ``resume_sent_at is None`` and reset time not reached yet.
+      2. Ready — ``resume_sent_at is None`` and reset+grace has passed → POST.
+      3. Verifying — ``resume_sent_at`` is set → wait for assistant activity in JSONL.
     """
     for pr in list(pending):
         project = os.path.basename(pr.cwd) or pr.session_id[:8]
@@ -246,34 +374,71 @@ def process_pending_resumes(pending: List[PendingResume]) -> None:
             )
 
         now = datetime.now(pr.reset_at.tzinfo)
-        if now >= pr.reset_at + timedelta(seconds=RESUME_GRACE_SECONDS):
-            if try_post_channel(RESUME_PROMPT):
-                log.info("Resumed via channel session=%s", pr.session_id)
-                send_notification(
-                    "Claude Resuming",
-                    f"{project} — resuming now",
-                )
+
+        # --- State 3: verifying a previous resume attempt ---
+        if pr.resume_sent_at is not None:
+            if now < pr.resume_sent_at + timedelta(seconds=VERIFY_WINDOW_SECONDS):
+                continue
+            if pr.jsonl_path and has_new_assistant_activity(pr.jsonl_path, pr.resume_sent_at):
+                log.info("Resume verified: session=%s", pr.session_id)
+                send_notification("Claude Resumed", f"{project} — confirmed active")
                 pending.remove(pr)
             else:
                 pr.resume_attempts += 1
+                pr.resume_sent_at = None
                 if pr.resume_attempts >= MAX_RESUME_ATTEMPTS:
                     log.warning(
-                        "Channel POST failed %d times for session=%s — giving up",
+                        "Resume not verified after %d attempts for session=%s — giving up",
                         pr.resume_attempts,
                         pr.session_id,
                     )
                     send_notification(
                         "Claude Resume Failed",
-                        f"{project} — channel not reachable after {pr.resume_attempts} attempts",
+                        f"{project} — no activity after {pr.resume_attempts} attempts",
                     )
                     pending.remove(pr)
                 else:
                     log.info(
-                        "Channel POST failed for session=%s — attempt %d/%d, will retry",
+                        "No activity after resume for session=%s — attempt %d/%d, retrying",
                         pr.session_id,
                         pr.resume_attempts,
                         MAX_RESUME_ATTEMPTS,
                     )
+            continue
+
+        # --- State 1: waiting for reset + grace ---
+        if now < pr.reset_at + timedelta(seconds=RESUME_GRACE_SECONDS):
+            continue
+
+        # --- State 2: ready to POST ---
+        if try_post_channel(RESUME_PROMPT):
+            if pr.jsonl_path:
+                log.info("Resume sent via channel session=%s, verifying…", pr.session_id)
+                pr.resume_sent_at = now
+            else:
+                log.info("Resumed via channel session=%s", pr.session_id)
+                send_notification("Claude Resuming", f"{project} — resuming now")
+                pending.remove(pr)
+        else:
+            pr.resume_attempts += 1
+            if pr.resume_attempts >= MAX_RESUME_ATTEMPTS:
+                log.warning(
+                    "Channel POST failed %d times for session=%s — giving up",
+                    pr.resume_attempts,
+                    pr.session_id,
+                )
+                send_notification(
+                    "Claude Resume Failed",
+                    f"{project} — channel not reachable after {pr.resume_attempts} attempts",
+                )
+                pending.remove(pr)
+            else:
+                log.info(
+                    "Channel POST failed for session=%s — attempt %d/%d, will retry",
+                    pr.session_id,
+                    pr.resume_attempts,
+                    MAX_RESUME_ATTEMPTS,
+                )
 
 
 def run_daemon(projects_root: Optional[Path] = None) -> None:
@@ -296,6 +461,7 @@ def run_daemon(projects_root: Optional[Path] = None) -> None:
     signal.signal(signal.SIGINT, _shutdown)
 
     log.info("Daemon started — watching %s", projects_root)
+    last_stale_scan: float = float("-inf")
 
     while running:
         # 1. Discover JSONL files
@@ -314,7 +480,52 @@ def run_daemon(projects_root: Optional[Path] = None) -> None:
         # 3. Process pending resumes
         process_pending_resumes(pending)
 
-        # 4. Sleep
+        # 4. Periodic stale-session scan (first run is immediate)
+        now_mono = time.monotonic()
+        if now_mono - last_stale_scan >= STALE_SCAN_INTERVAL_SECONDS:
+            last_stale_scan = now_mono
+            active_cwds = find_claude_session_cwds()
+            scan_paths = [p for p in watchers if "/subagents/" not in p]
+            stale = find_unresolved_rate_limits(scan_paths)
+            now_utc = datetime.now(ZoneInfo("UTC"))
+            for info in stale:
+                entry_age = (
+                    now_utc - datetime.fromisoformat(info["timestamp"].replace("Z", "+00:00"))
+                ).total_seconds()
+                if entry_age > STALE_SCAN_MAX_AGE_SECONDS:
+                    continue
+                if any(p.session_id == info["session_id"] for p in pending):
+                    continue
+                if not is_latest_session_in_project(info["jsonl_path"]):
+                    log.debug(
+                        "Stale session=%s superseded by newer session — skipping",
+                        info["session_id"][:8],
+                    )
+                    continue
+                if info["cwd"] not in active_cwds:
+                    log.debug(
+                        "Stale rate limit for inactive session=%s (cwd=%s) — skipping",
+                        info["session_id"][:8],
+                        info["cwd"],
+                    )
+                    continue
+                log.info(
+                    "Stale rate limit found: session=%s cwd=%s — adding to pending",
+                    info["session_id"],
+                    info["cwd"],
+                )
+                pending.append(
+                    PendingResume(
+                        session_id=info["session_id"],
+                        cwd=info["cwd"],
+                        reset_at=datetime.now(ZoneInfo("UTC"))
+                        - timedelta(seconds=RESUME_GRACE_SECONDS + 1),
+                        jsonl_path=info["jsonl_path"],
+                        notified=True,
+                    )
+                )
+
+        # 5. Sleep
         time.sleep(POLL_INTERVAL_SECONDS)
 
 

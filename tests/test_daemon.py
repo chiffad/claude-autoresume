@@ -27,9 +27,13 @@ from daemon import (
     send_notification,
     make_rate_limit_handler,
     process_pending_resumes,
+    find_unresolved_rate_limits,
+    is_latest_session_in_project,
+    has_new_assistant_activity,
     PendingResume,
     RESUME_GRACE_SECONDS,
     MAX_RESUME_ATTEMPTS,
+    VERIFY_WINDOW_SECONDS,
     UNKNOWN_RESET_FALLBACK_MINUTES,
 )
 
@@ -694,3 +698,288 @@ def test_filewatcher_skips_empty_lines():
         assert collected == ["line1", "line2"]
     finally:
         os.unlink(path)
+
+
+# --- find_unresolved_rate_limits tests ---
+
+
+def _write_jsonl(tmp_path, filename, entries):
+    """Helper: write a list of dicts as JSONL and return the path."""
+    path = tmp_path / filename
+    with open(path, "w") as f:
+        for entry in entries:
+            f.write(_json.dumps(entry) + "\n")
+    return str(path)
+
+
+RL_ENTRY = _json.loads((FIXTURES / "rate_limit_entry.jsonl").read_text().strip())
+NORMAL_ASSISTANT = {
+    "type": "assistant",
+    "sessionId": RL_ENTRY["sessionId"],
+    "cwd": RL_ENTRY["cwd"],
+    "timestamp": "2026-04-07T17:00:00.000Z",
+    "message": {"content": [{"text": "Here is the result…"}]},
+}
+QUEUE_OP = {
+    "type": "queue-operation",
+    "sessionId": RL_ENTRY["sessionId"],
+    "timestamp": "2026-04-07T16:15:00.000Z",
+}
+USER_ENTRY = {
+    "type": "user",
+    "sessionId": RL_ENTRY["sessionId"],
+    "cwd": RL_ENTRY["cwd"],
+    "timestamp": "2026-04-07T16:15:00.000Z",
+    "message": {"content": [{"text": "continue"}]},
+}
+
+
+def test_find_unresolved_detects_stale_rate_limit(tmp_path):
+    """JSONL ending with a rate_limit entry is detected as unresolved."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [NORMAL_ASSISTANT, RL_ENTRY])
+    results = find_unresolved_rate_limits([path])
+    assert len(results) == 1
+    assert results[0]["session_id"] == RL_ENTRY["sessionId"]
+    assert results[0]["jsonl_path"] == path
+
+
+def test_find_unresolved_ignores_resolved_session(tmp_path):
+    """JSONL with assistant activity after rate_limit is not flagged."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [RL_ENTRY, NORMAL_ASSISTANT])
+    results = find_unresolved_rate_limits([path])
+    assert results == []
+
+
+def test_find_unresolved_ignores_queue_ops_after_rate_limit(tmp_path):
+    """Queue-operation and user entries after rate_limit don't count as recovery."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [RL_ENTRY, QUEUE_OP, USER_ENTRY])
+    results = find_unresolved_rate_limits([path])
+    assert len(results) == 1
+
+
+def test_find_unresolved_empty_file(tmp_path):
+    """Empty JSONL returns no results."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [])
+    results = find_unresolved_rate_limits([path])
+    assert results == []
+
+
+def test_find_unresolved_no_rate_limit_entries(tmp_path):
+    """JSONL with only normal entries returns no results."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [NORMAL_ASSISTANT, USER_ENTRY])
+    results = find_unresolved_rate_limits([path])
+    assert results == []
+
+
+def test_find_unresolved_multiple_rate_limits_last_resolved(tmp_path):
+    """Multiple rate_limit entries — only unresolved if the LAST one has no assistant after."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [
+        RL_ENTRY, NORMAL_ASSISTANT,  # first cycle: resolved
+        RL_ENTRY, NORMAL_ASSISTANT,  # second cycle: resolved
+    ])
+    results = find_unresolved_rate_limits([path])
+    assert results == []
+
+
+def test_find_unresolved_multiple_rate_limits_last_unresolved(tmp_path):
+    """Multiple rate_limit entries — detected if the LAST one has no assistant after."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [
+        RL_ENTRY, NORMAL_ASSISTANT,  # first cycle: resolved
+        RL_ENTRY,                    # second cycle: stuck
+    ])
+    results = find_unresolved_rate_limits([path])
+    assert len(results) == 1
+
+
+def test_find_unresolved_missing_file():
+    """Non-existent file is silently skipped."""
+    results = find_unresolved_rate_limits(["/tmp/does_not_exist_12345.jsonl"])
+    assert results == []
+
+
+# --- has_new_assistant_activity tests ---
+
+
+def test_has_activity_after_timestamp(tmp_path):
+    """Returns True when an assistant entry exists after the given time."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [RL_ENTRY, NORMAL_ASSISTANT])
+    after = datetime(2026, 4, 7, 16, 30, tzinfo=ZoneInfo("UTC"))
+    assert has_new_assistant_activity(str(path), after) is True
+
+
+def test_no_activity_after_timestamp(tmp_path):
+    """Returns False when all assistant entries are before the given time."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [NORMAL_ASSISTANT, RL_ENTRY])
+    after = datetime(2026, 4, 7, 18, 0, tzinfo=ZoneInfo("UTC"))
+    assert has_new_assistant_activity(str(path), after) is False
+
+
+def test_no_activity_error_assistant_not_counted(tmp_path):
+    """Assistant entries with an error field are not counted as activity."""
+    path = _write_jsonl(tmp_path, "sess.jsonl", [RL_ENTRY])
+    after = datetime(2026, 4, 7, 15, 0, tzinfo=ZoneInfo("UTC"))
+    assert has_new_assistant_activity(str(path), after) is False
+
+
+def test_has_activity_missing_file():
+    """Missing file returns False."""
+    after = datetime(2026, 1, 1, tzinfo=ZoneInfo("UTC"))
+    assert has_new_assistant_activity("/tmp/nope_12345.jsonl", after) is False
+
+
+# --- process_pending_resumes: post-resume verification tests ---
+
+
+def test_resume_enters_verify_state_when_jsonl_path_set(monkeypatch):
+    """Successful POST with jsonl_path sets resume_sent_at instead of removing."""
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+    now_fixed = datetime(2026, 4, 7, 17, 5, tzinfo=paris)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        jsonl_path="/some/file.jsonl",
+        notified=True,
+    )
+    pending = [pr]
+
+    monkeypatch.setattr("daemon.try_post_channel", lambda p: True)
+    monkeypatch.setattr("daemon.send_notification", lambda *a, **kw: None)
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert len(pending) == 1
+    assert pr.resume_sent_at == now_fixed
+
+
+def test_resume_verified_removes_from_pending(monkeypatch):
+    """After verify window, if JSONL has activity, entry is removed."""
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+    resume_sent = datetime(2026, 4, 7, 17, 5, tzinfo=paris)
+    now_fixed = resume_sent + timedelta(seconds=VERIFY_WINDOW_SECONDS + 1)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        jsonl_path="/some/file.jsonl",
+        notified=True,
+        resume_sent_at=resume_sent,
+    )
+    pending = [pr]
+
+    monkeypatch.setattr("daemon.has_new_assistant_activity", lambda path, after: True)
+    monkeypatch.setattr("daemon.send_notification", lambda *a, **kw: None)
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert len(pending) == 0
+
+
+def test_resume_not_verified_retries(monkeypatch):
+    """No activity after verify window → resume_sent_at reset, attempts incremented."""
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+    resume_sent = datetime(2026, 4, 7, 17, 5, tzinfo=paris)
+    now_fixed = resume_sent + timedelta(seconds=VERIFY_WINDOW_SECONDS + 1)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        jsonl_path="/some/file.jsonl",
+        notified=True,
+        resume_sent_at=resume_sent,
+        resume_attempts=0,
+    )
+    pending = [pr]
+
+    monkeypatch.setattr("daemon.has_new_assistant_activity", lambda path, after: False)
+    monkeypatch.setattr("daemon.send_notification", lambda *a, **kw: None)
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert len(pending) == 1
+    assert pr.resume_sent_at is None
+    assert pr.resume_attempts == 1
+
+
+def test_resume_verify_gives_up_after_max_attempts(monkeypatch):
+    """Verification failures exhaust MAX_RESUME_ATTEMPTS → entry removed."""
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+    resume_sent = datetime(2026, 4, 7, 17, 5, tzinfo=paris)
+    now_fixed = resume_sent + timedelta(seconds=VERIFY_WINDOW_SECONDS + 1)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        jsonl_path="/some/file.jsonl",
+        notified=True,
+        resume_sent_at=resume_sent,
+        resume_attempts=MAX_RESUME_ATTEMPTS - 1,
+    )
+    pending = [pr]
+
+    notifications = []
+    monkeypatch.setattr("daemon.has_new_assistant_activity", lambda path, after: False)
+    monkeypatch.setattr(
+        "daemon.send_notification",
+        lambda title, body: notifications.append((title, body)),
+    )
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert len(pending) == 0
+    assert any("Failed" in t for t, _ in notifications)
+
+
+def test_resume_without_jsonl_path_removes_immediately(monkeypatch):
+    """Successful POST without jsonl_path falls back to immediate removal."""
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+    now_fixed = datetime(2026, 4, 7, 17, 5, tzinfo=paris)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        notified=True,
+    )
+    pending = [pr]
+
+    monkeypatch.setattr("daemon.try_post_channel", lambda p: True)
+    monkeypatch.setattr("daemon.send_notification", lambda *a, **kw: None)
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert len(pending) == 0
+
+
+# --- is_latest_session_in_project tests ---
+
+
+def test_latest_session_true_when_newest(tmp_path):
+    """Most recently modified JSONL returns True."""
+    _write_jsonl(tmp_path, "old.jsonl", [NORMAL_ASSISTANT])
+    import time
+    time.sleep(0.05)
+    new = _write_jsonl(tmp_path, "new.jsonl", [NORMAL_ASSISTANT])
+    old = str(tmp_path / "old.jsonl")
+    assert is_latest_session_in_project(new) is True
+    assert is_latest_session_in_project(old) is False
+
+
+def test_latest_session_single_file(tmp_path):
+    """Single JSONL file is always the latest."""
+    path = _write_jsonl(tmp_path, "only.jsonl", [NORMAL_ASSISTANT])
+    assert is_latest_session_in_project(path) is True
