@@ -7,6 +7,8 @@ A macOS daemon that automatically resumes Claude Code sessions after rate limits
 1. **Watches** Claude Code's JSONL log files (`~/.claude/projects/`) for rate-limit errors
 2. **Notifies** you via macOS notification when a rate limit is hit, showing the reset time
 3. **Resumes** the session 90 seconds after the limit resets by POSTing a resume prompt to the autoresume channel server, which pushes it natively into the running Claude Code session
+4. **Verifies** the resume by watching for new assistant activity in the JSONL log; retries up to 5 times if needed, then notifies you if it gives up
+5. **Recovers stale sessions** on startup: if Claude was rate-limited before the daemon was running, it detects this and resumes automatically (as long as the Claude process is still active)
 
 ## Setup
 
@@ -19,7 +21,7 @@ This installs everything in one step:
 - `autoresume` MCP server entry in `~/.claude.json`
 - LaunchAgent daemon (runs at login, restarts automatically)
 
-Logs: `~/.local/share/claude-autoresume/`
+Logs and auth token: `~/.local/share/claude-autoresume/`
 
 After setup, restart Claude Code with the channel:
 
