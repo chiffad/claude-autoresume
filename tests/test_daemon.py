@@ -30,9 +30,14 @@ from daemon import (
     find_unresolved_rate_limits,
     is_latest_session_in_project,
     has_new_assistant_activity,
+    dismiss_interactive_prompt,
+    _dismiss_via_tmux,
+    _dismiss_via_terminal_app,
+    _find_claude_tty_for_cwd,
     PendingResume,
     RESUME_GRACE_SECONDS,
     MAX_RESUME_ATTEMPTS,
+    MAX_PROMPT_DISMISS_ATTEMPTS,
     VERIFY_WINDOW_SECONDS,
     UNKNOWN_RESET_FALLBACK_MINUTES,
 )
@@ -983,3 +988,219 @@ def test_latest_session_single_file(tmp_path):
     """Single JSONL file is always the latest."""
     path = _write_jsonl(tmp_path, "only.jsonl", [NORMAL_ASSISTANT])
     assert is_latest_session_in_project(path) is True
+
+
+# --- dismiss_interactive_prompt tests ---
+
+
+def test_dismiss_via_tmux_success(monkeypatch):
+    """tmux pane matching cwd gets Enter sent to it."""
+    calls = []
+
+    def mock_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "tmux" and "list-panes" in cmd:
+            result = type("R", (), {
+                "returncode": 0,
+                "stdout": "sess:0.0 claude /some/project\nsess:0.1 zsh /other\n",
+                "stderr": "",
+            })()
+            return result
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    assert _dismiss_via_tmux("/some/project") is True
+    assert any("send-keys" in str(c) for c in calls)
+
+
+def test_dismiss_via_tmux_no_match(monkeypatch):
+    """tmux pane with different cwd is not targeted."""
+    def mock_run(cmd, **kwargs):
+        if cmd[0] == "tmux" and "list-panes" in cmd:
+            return type("R", (), {
+                "returncode": 0,
+                "stdout": "sess:0.0 claude /other/project\n",
+                "stderr": "",
+            })()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    assert _dismiss_via_tmux("/some/project") is False
+
+
+def test_dismiss_via_tmux_not_installed(monkeypatch):
+    """Missing tmux binary returns False without raising."""
+    def mock_run(cmd, **kwargs):
+        raise FileNotFoundError("tmux not found")
+
+    monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    assert _dismiss_via_tmux("/some/project") is False
+
+
+def test_find_claude_tty_for_cwd_match(monkeypatch):
+    """Finds the TTY for a Claude process matching the target cwd."""
+    def mock_run(cmd, **kwargs):
+        if cmd[0] == "ps":
+            return type("R", (), {
+                "returncode": 0,
+                "stdout": "  PID TTY      COMMAND\n12345 ttys001  claude --continue\n",
+                "stderr": "",
+            })()
+        if cmd[0] == "lsof":
+            return type("R", (), {
+                "returncode": 0,
+                "stdout": "p12345\nn/some/project\n",
+                "stderr": "",
+            })()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    assert _find_claude_tty_for_cwd("/some/project") == "/dev/ttys001"
+
+
+def test_find_claude_tty_for_cwd_no_match(monkeypatch):
+    """Returns None when no Claude process matches the target cwd."""
+    def mock_run(cmd, **kwargs):
+        if cmd[0] == "ps":
+            return type("R", (), {
+                "returncode": 0,
+                "stdout": "  PID TTY      COMMAND\n12345 ttys001  claude --continue\n",
+                "stderr": "",
+            })()
+        if cmd[0] == "lsof":
+            return type("R", (), {
+                "returncode": 0,
+                "stdout": "p12345\nn/other/project\n",
+                "stderr": "",
+            })()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    assert _find_claude_tty_for_cwd("/some/project") is None
+
+
+def test_dismiss_via_terminal_app_success(monkeypatch):
+    """Terminal.app AppleScript returning 'ok' counts as success."""
+    monkeypatch.setattr("daemon._find_claude_tty_for_cwd", lambda cwd: "/dev/ttys001")
+
+    def mock_run(cmd, **kwargs):
+        return type("R", (), {"returncode": 0, "stdout": "ok\n", "stderr": ""})()
+
+    monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    assert _dismiss_via_terminal_app("/some/project") is True
+
+
+def test_dismiss_via_terminal_app_not_found(monkeypatch):
+    """No matching TTY returns False without running AppleScript."""
+    monkeypatch.setattr("daemon._find_claude_tty_for_cwd", lambda cwd: None)
+    assert _dismiss_via_terminal_app("/some/project") is False
+
+
+def test_dismiss_interactive_prompt_tries_tmux_first(monkeypatch):
+    """tmux is tried first; Terminal.app is skipped if tmux succeeds."""
+    order = []
+    monkeypatch.setattr("daemon._dismiss_via_tmux", lambda cwd: (order.append("tmux"), True)[-1])
+    monkeypatch.setattr("daemon._dismiss_via_terminal_app", lambda cwd: (order.append("terminal"), True)[-1])
+    assert dismiss_interactive_prompt("/p") is True
+    assert order == ["tmux"]
+
+
+def test_dismiss_interactive_prompt_falls_back_to_terminal(monkeypatch):
+    """If tmux fails, Terminal.app is tried."""
+    order = []
+    monkeypatch.setattr("daemon._dismiss_via_tmux", lambda cwd: (order.append("tmux"), False)[-1])
+    monkeypatch.setattr("daemon._dismiss_via_terminal_app", lambda cwd: (order.append("terminal"), True)[-1])
+    assert dismiss_interactive_prompt("/p") is True
+    assert order == ["tmux", "terminal"]
+
+
+def test_dismiss_interactive_prompt_both_fail(monkeypatch):
+    """Both methods failing returns False."""
+    monkeypatch.setattr("daemon._dismiss_via_tmux", lambda cwd: False)
+    monkeypatch.setattr("daemon._dismiss_via_terminal_app", lambda cwd: False)
+    assert dismiss_interactive_prompt("/p") is False
+
+
+def test_process_pending_resumes_dismisses_prompt(monkeypatch):
+    """Prompt dismissal is attempted before notification."""
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 19, 0, tzinfo=paris)
+    now_fixed = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        notified=False,
+    )
+    pending = [pr]
+
+    dismiss_calls = []
+    monkeypatch.setattr(
+        "daemon.dismiss_interactive_prompt",
+        lambda cwd: (dismiss_calls.append(cwd), True)[-1],
+    )
+    monkeypatch.setattr("daemon.send_notification", lambda *a, **kw: None)
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert dismiss_calls == ["/some/project"]
+    assert pr.prompt_dismissed is True
+    assert pr.prompt_dismiss_attempts == 1
+
+
+def test_process_pending_resumes_stops_dismissing_after_success(monkeypatch):
+    """Once prompt_dismissed is True, no further attempts are made."""
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 19, 0, tzinfo=paris)
+    now_fixed = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        notified=True,
+        prompt_dismissed=True,
+    )
+    pending = [pr]
+
+    dismiss_calls = []
+    monkeypatch.setattr(
+        "daemon.dismiss_interactive_prompt",
+        lambda cwd: (dismiss_calls.append(cwd), True)[-1],
+    )
+    monkeypatch.setattr("daemon.send_notification", lambda *a, **kw: None)
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert dismiss_calls == []
+
+
+def test_process_pending_resumes_gives_up_dismissing(monkeypatch):
+    """After MAX_PROMPT_DISMISS_ATTEMPTS, no more dismiss calls are made."""
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 19, 0, tzinfo=paris)
+    now_fixed = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        notified=True,
+        prompt_dismiss_attempts=MAX_PROMPT_DISMISS_ATTEMPTS,
+    )
+    pending = [pr]
+
+    dismiss_calls = []
+    monkeypatch.setattr(
+        "daemon.dismiss_interactive_prompt",
+        lambda cwd: (dismiss_calls.append(cwd), False)[-1],
+    )
+    monkeypatch.setattr("daemon.send_notification", lambda *a, **kw: None)
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert dismiss_calls == []

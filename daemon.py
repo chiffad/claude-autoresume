@@ -166,6 +166,126 @@ def send_notification(title: str, body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Prompt dismissal — auto-select "Stop and wait" on rate-limit prompt
+# ---------------------------------------------------------------------------
+
+MAX_PROMPT_DISMISS_ATTEMPTS = 3
+
+
+def _dismiss_via_tmux(cwd: str) -> bool:
+    """Send Enter to a tmux pane running claude in *cwd*."""
+    try:
+        result = subprocess.run(
+            [
+                "tmux", "list-panes", "-a", "-F",
+                "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} #{pane_current_path}",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            pane_target, pane_cmd, pane_path = parts
+            if "claude" in pane_cmd.lower() and os.path.abspath(pane_path) == os.path.abspath(cwd):
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", pane_target, "Enter"],
+                    check=True, timeout=5,
+                )
+                log.info("Dismissed prompt via tmux pane %s", pane_target)
+                return True
+    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        log.debug("tmux dismiss failed: %s", exc)
+    return False
+
+
+def _find_claude_tty_for_cwd(cwd: str) -> Optional[str]:
+    """Return the TTY device path of a Claude process whose cwd matches."""
+    try:
+        ps = subprocess.run(
+            ["ps", "-eo", "pid,tty,command"],
+            capture_output=True, text=True, timeout=10,
+        )
+        candidates = []
+        for line in ps.stdout.splitlines()[1:]:
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, tty, cmd = parts
+            if "claude" in cmd and "autoresume" not in cmd and tty != "??":
+                candidates.append((pid, tty))
+
+        for pid, tty in candidates:
+            lsof = subprocess.run(
+                ["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for lsof_line in lsof.stdout.splitlines():
+                if lsof_line.startswith("n") and len(lsof_line) > 1:
+                    proc_cwd = lsof_line[1:]
+                    if os.path.abspath(proc_cwd) == os.path.abspath(cwd):
+                        return f"/dev/{tty}" if not tty.startswith("/dev/") else tty
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log.debug("TTY lookup failed: %s", exc)
+    return None
+
+
+def _dismiss_via_terminal_app(cwd: str) -> bool:
+    """Bring the Terminal.app tab running claude in *cwd* to front and send Enter."""
+    target_tty = _find_claude_tty_for_cwd(cwd)
+    if not target_tty:
+        log.debug("No Claude TTY found for cwd=%s", cwd)
+        return False
+
+    safe_tty = target_tty.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'''\
+tell application "Terminal"
+    repeat with w in every window
+        repeat with t in every tab of w
+            if tty of t is "{safe_tty}" then
+                set frontmost to true
+                set index of w to 1
+                set selected tab of w to t
+                delay 0.3
+                tell application "System Events"
+                    key code 36
+                end tell
+                return "ok"
+            end if
+        end repeat
+    end repeat
+end tell
+return "not_found"
+'''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.stdout.strip() == "ok":
+            log.info("Dismissed prompt via Terminal.app (tty=%s)", target_tty)
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log.debug("Terminal.app dismiss failed: %s", exc)
+    return False
+
+
+def dismiss_interactive_prompt(cwd: str) -> bool:
+    """Auto-dismiss the rate-limit "What do you want to do?" prompt.
+
+    Tries tmux first (works in background), then Terminal.app AppleScript.
+    """
+    if _dismiss_via_tmux(cwd):
+        return True
+    if _dismiss_via_terminal_app(cwd):
+        return True
+    log.debug("Could not dismiss interactive prompt for cwd=%s", cwd)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Daemon loop
 # ---------------------------------------------------------------------------
 
@@ -189,6 +309,8 @@ class PendingResume:
     notified: bool = False
     resume_attempts: int = 0
     resume_sent_at: Optional[datetime] = None
+    prompt_dismissed: bool = False
+    prompt_dismiss_attempts: int = 0
 
 
 def make_rate_limit_handler(pending: List[PendingResume]) -> Callable[[str], None]:
@@ -360,6 +482,18 @@ def process_pending_resumes(pending: List[PendingResume]) -> None:
     """
     for pr in list(pending):
         project = os.path.basename(pr.cwd) or pr.session_id[:8]
+
+        # --- Dismiss the interactive "What do you want to do?" prompt ---
+        if not pr.prompt_dismissed and pr.prompt_dismiss_attempts < MAX_PROMPT_DISMISS_ATTEMPTS:
+            pr.prompt_dismiss_attempts += 1
+            if dismiss_interactive_prompt(pr.cwd):
+                pr.prompt_dismissed = True
+            elif pr.prompt_dismiss_attempts >= MAX_PROMPT_DISMISS_ATTEMPTS:
+                log.warning(
+                    "Could not dismiss prompt for session=%s after %d attempts",
+                    pr.session_id,
+                    pr.prompt_dismiss_attempts,
+                )
 
         if not pr.notified:
             send_notification(
