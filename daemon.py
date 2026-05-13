@@ -172,13 +172,32 @@ def send_notification(title: str, body: str) -> None:
 MAX_PROMPT_DISMISS_ATTEMPTS = 3
 
 
+def _pane_runs_claude(pane_pid: str) -> bool:
+    """True if a child process of *pane_pid* (the shell) is named 'claude'."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-P", pane_pid],
+            capture_output=True, text=True, timeout=5,
+        )
+        for child_pid in result.stdout.split():
+            ps = subprocess.run(
+                ["ps", "-p", child_pid, "-o", "comm="],
+                capture_output=True, text=True, timeout=5,
+            )
+            if "claude" in ps.stdout.strip().lower():
+                return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False
+
+
 def _dismiss_via_tmux(cwd: str) -> bool:
     """Send Enter to a tmux pane running claude in *cwd*."""
     try:
         result = subprocess.run(
             [
                 "tmux", "list-panes", "-a", "-F",
-                "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} #{pane_current_path}",
+                "#{session_name}:#{window_index}.#{pane_index} #{pane_pid} #{pane_current_path}",
             ],
             capture_output=True, text=True, timeout=5,
         )
@@ -188,13 +207,13 @@ def _dismiss_via_tmux(cwd: str) -> bool:
             parts = line.split(None, 2)
             if len(parts) < 3:
                 continue
-            pane_target, pane_cmd, pane_path = parts
-            if "claude" in pane_cmd.lower() and os.path.abspath(pane_path) == os.path.abspath(cwd):
+            pane_target, pane_pid, pane_path = parts
+            if os.path.abspath(pane_path) == os.path.abspath(cwd) and _pane_runs_claude(pane_pid):
                 subprocess.run(
                     ["tmux", "send-keys", "-t", pane_target, "Enter"],
                     check=True, timeout=5,
                 )
-                log.info("Dismissed prompt via tmux pane %s", pane_target)
+                log.info("Dismissed prompt via tmux pane %s (shell pid=%s)", pane_target, pane_pid)
                 return True
     except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         log.debug("tmux dismiss failed: %s", exc)
@@ -293,6 +312,7 @@ POLL_INTERVAL_SECONDS = 10
 RESUME_GRACE_SECONDS = 90
 MAX_RESUME_ATTEMPTS = 5
 UNKNOWN_RESET_FALLBACK_MINUTES = 5
+PROMPT_DISMISS_INITIAL_DELAY_SECONDS = 5
 STALE_SCAN_INTERVAL_SECONDS = 600
 STALE_SCAN_MAX_AGE_SECONDS = 72 * 3600
 VERIFY_WINDOW_SECONDS = 120
@@ -311,6 +331,7 @@ class PendingResume:
     resume_sent_at: Optional[datetime] = None
     prompt_dismissed: bool = False
     prompt_dismiss_attempts: int = 0
+    first_seen_at: Optional[float] = None
 
 
 def make_rate_limit_handler(pending: List[PendingResume]) -> Callable[[str], None]:
@@ -483,8 +504,12 @@ def process_pending_resumes(pending: List[PendingResume]) -> None:
     for pr in list(pending):
         project = os.path.basename(pr.cwd) or pr.session_id[:8]
 
+        if pr.first_seen_at is None:
+            pr.first_seen_at = time.monotonic()
+
         # --- Dismiss the interactive "What do you want to do?" prompt ---
-        if not pr.prompt_dismissed and pr.prompt_dismiss_attempts < MAX_PROMPT_DISMISS_ATTEMPTS:
+        delay_elapsed = time.monotonic() - pr.first_seen_at >= PROMPT_DISMISS_INITIAL_DELAY_SECONDS
+        if not pr.prompt_dismissed and pr.prompt_dismiss_attempts < MAX_PROMPT_DISMISS_ATTEMPTS and delay_elapsed:
             pr.prompt_dismiss_attempts += 1
             if dismiss_interactive_prompt(pr.cwd):
                 pr.prompt_dismissed = True

@@ -38,8 +38,10 @@ from daemon import (
     RESUME_GRACE_SECONDS,
     MAX_RESUME_ATTEMPTS,
     MAX_PROMPT_DISMISS_ATTEMPTS,
+    PROMPT_DISMISS_INITIAL_DELAY_SECONDS,
     VERIFY_WINDOW_SECONDS,
     UNKNOWN_RESET_FALLBACK_MINUTES,
+    _pane_runs_claude,
 )
 
 
@@ -993,22 +995,48 @@ def test_latest_session_single_file(tmp_path):
 # --- dismiss_interactive_prompt tests ---
 
 
+def test_pane_runs_claude_true(monkeypatch):
+    """Detects claude as a child process of a shell PID."""
+    def mock_run(cmd, **kwargs):
+        if cmd[0] == "pgrep":
+            return type("R", (), {"stdout": "12345\n", "stderr": "", "returncode": 0})()
+        if cmd[0] == "ps":
+            return type("R", (), {"stdout": "claude\n", "stderr": "", "returncode": 0})()
+        return type("R", (), {"stdout": "", "stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    assert _pane_runs_claude("999") is True
+
+
+def test_pane_runs_claude_false(monkeypatch):
+    """Returns False when child is not claude."""
+    def mock_run(cmd, **kwargs):
+        if cmd[0] == "pgrep":
+            return type("R", (), {"stdout": "12345\n", "stderr": "", "returncode": 0})()
+        if cmd[0] == "ps":
+            return type("R", (), {"stdout": "vim\n", "stderr": "", "returncode": 0})()
+        return type("R", (), {"stdout": "", "stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    assert _pane_runs_claude("999") is False
+
+
 def test_dismiss_via_tmux_success(monkeypatch):
-    """tmux pane matching cwd gets Enter sent to it."""
+    """tmux pane matching cwd with claude child gets Enter sent."""
     calls = []
 
     def mock_run(cmd, **kwargs):
         calls.append(cmd)
         if cmd[0] == "tmux" and "list-panes" in cmd:
-            result = type("R", (), {
+            return type("R", (), {
                 "returncode": 0,
-                "stdout": "sess:0.0 claude /some/project\nsess:0.1 zsh /other\n",
+                "stdout": "sess:0.0 999 /some/project\nsess:0.1 888 /other\n",
                 "stderr": "",
             })()
-            return result
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    monkeypatch.setattr("daemon._pane_runs_claude", lambda pid: pid == "999")
     assert _dismiss_via_tmux("/some/project") is True
     assert any("send-keys" in str(c) for c in calls)
 
@@ -1019,12 +1047,13 @@ def test_dismiss_via_tmux_no_match(monkeypatch):
         if cmd[0] == "tmux" and "list-panes" in cmd:
             return type("R", (), {
                 "returncode": 0,
-                "stdout": "sess:0.0 claude /other/project\n",
+                "stdout": "sess:0.0 999 /other/project\n",
                 "stderr": "",
             })()
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr("daemon.subprocess.run", mock_run)
+    monkeypatch.setattr("daemon._pane_runs_claude", lambda pid: True)
     assert _dismiss_via_tmux("/some/project") is False
 
 
@@ -1122,7 +1151,8 @@ def test_dismiss_interactive_prompt_both_fail(monkeypatch):
 
 
 def test_process_pending_resumes_dismisses_prompt(monkeypatch):
-    """Prompt dismissal is attempted before notification."""
+    """Prompt dismissal is attempted after initial delay elapses."""
+    import time as _time
     paris = ZoneInfo("Europe/Paris")
     reset_at = datetime(2026, 4, 7, 19, 0, tzinfo=paris)
     now_fixed = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
@@ -1132,6 +1162,7 @@ def test_process_pending_resumes_dismisses_prompt(monkeypatch):
         cwd="/some/project",
         reset_at=reset_at,
         notified=False,
+        first_seen_at=_time.monotonic() - PROMPT_DISMISS_INITIAL_DELAY_SECONDS - 1,
     )
     pending = [pr]
 
@@ -1150,8 +1181,39 @@ def test_process_pending_resumes_dismisses_prompt(monkeypatch):
     assert pr.prompt_dismiss_attempts == 1
 
 
+def test_process_pending_resumes_skips_dismiss_during_initial_delay(monkeypatch):
+    """Dismiss is skipped while initial delay hasn't elapsed."""
+    import time as _time
+    paris = ZoneInfo("Europe/Paris")
+    reset_at = datetime(2026, 4, 7, 19, 0, tzinfo=paris)
+    now_fixed = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
+
+    pr = PendingResume(
+        session_id="sess-1",
+        cwd="/some/project",
+        reset_at=reset_at,
+        notified=False,
+        first_seen_at=_time.monotonic(),
+    )
+    pending = [pr]
+
+    dismiss_calls = []
+    monkeypatch.setattr(
+        "daemon.dismiss_interactive_prompt",
+        lambda cwd: (dismiss_calls.append(cwd), True)[-1],
+    )
+    monkeypatch.setattr("daemon.send_notification", lambda *a, **kw: None)
+    _mock_datetime_now(monkeypatch, now_fixed)
+
+    process_pending_resumes(pending)
+
+    assert dismiss_calls == []
+    assert pr.prompt_dismissed is False
+
+
 def test_process_pending_resumes_stops_dismissing_after_success(monkeypatch):
     """Once prompt_dismissed is True, no further attempts are made."""
+    import time as _time
     paris = ZoneInfo("Europe/Paris")
     reset_at = datetime(2026, 4, 7, 19, 0, tzinfo=paris)
     now_fixed = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
@@ -1162,6 +1224,7 @@ def test_process_pending_resumes_stops_dismissing_after_success(monkeypatch):
         reset_at=reset_at,
         notified=True,
         prompt_dismissed=True,
+        first_seen_at=_time.monotonic() - PROMPT_DISMISS_INITIAL_DELAY_SECONDS - 1,
     )
     pending = [pr]
 
@@ -1180,6 +1243,7 @@ def test_process_pending_resumes_stops_dismissing_after_success(monkeypatch):
 
 def test_process_pending_resumes_gives_up_dismissing(monkeypatch):
     """After MAX_PROMPT_DISMISS_ATTEMPTS, no more dismiss calls are made."""
+    import time as _time
     paris = ZoneInfo("Europe/Paris")
     reset_at = datetime(2026, 4, 7, 19, 0, tzinfo=paris)
     now_fixed = datetime(2026, 4, 7, 17, 0, tzinfo=paris)
@@ -1190,6 +1254,7 @@ def test_process_pending_resumes_gives_up_dismissing(monkeypatch):
         reset_at=reset_at,
         notified=True,
         prompt_dismiss_attempts=MAX_PROMPT_DISMISS_ATTEMPTS,
+        first_seen_at=_time.monotonic() - PROMPT_DISMISS_INITIAL_DELAY_SECONDS - 1,
     )
     pending = [pr]
 
